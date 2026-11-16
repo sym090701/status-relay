@@ -1,0 +1,22 @@
+[Unit]
+Description=Status Relay NAS pull agent
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/status-relay
+EnvironmentFile=/etc/status-relay/agent.env
+ExecStart=/usr/bin/python3 /opt/status-relay/agent.py
+Restart=always
+RestartSec=10
+User=status-relay
+Group=status-relay
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/vol3/1000/512/status-relay
+
+[Install]
+WantedBy=multi-user.target
