@@ -1,0 +1,22 @@
+[Unit]
+Description=Status Relay webhook queue
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/status-relay
+EnvironmentFile=/etc/status-relay/relay.env
+ExecStart=/usr/bin/python3 /opt/status-relay/relay.py
+Restart=always
+RestartSec=5
+User=status-relay
+Group=status-relay
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/status-relay
+
+[Install]
+WantedBy=multi-user.target
