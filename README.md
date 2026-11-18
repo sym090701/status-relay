@@ -226,11 +226,11 @@ journalctl -u status-relay-agent.service -n 50 --no-pager
 
 运行时数据、环境文件、SQLite 数据库和密钥均不应提交到 Git。
 
-## 小喵家外状态和预热（代码已实现，尚未部署）
+## 小喵家外状态和预热（状态读取已部署）
 
 `home_relay.py` 是独立的单项目服务，使用独立 SQLite 数据库和凭据，不接入 `/v1/events` 或 NAS Agent 的 ACK 队列。`home_agent.py` 在家庭侧主动连接该服务，读取 Ubuntu 额度服务并提交经过白名单筛选的状态；它只支持固定的 `preheat` 操作，不能执行 Shell、任意 URL 或文件操作。小喵在家庭 Wi-Fi 沿用原有局域网接口；SSID 只是网络选择条件，不能作为身份认证。
 
-**当前状态：** 本地模拟和 Ubuntu 源码副本上的 guard 补丁测试通过。新服务、家庭 Agent、Ubuntu guard、HTTPS 反代和小喵固件均未部署或实机验证；未执行真实预热。143 当前已有 Nginx 监听 80/443，但只读检查未发现它转发 8780、8781 或 `/v1/home/`；需先确认域名、DNS、证书和允许公开的路径，不能把现有 Relay 或家庭管理端口直接暴露。配置前请先备份并检查原有 Nginx、DNS 和服务。
+**部署快照（2026-11-18）：** 独立中继、受限 HTTPS 反代、家庭 Agent 和 Ubuntu guard 已部署；公网状态读取已验证。远程预热执行开关仍关闭：签名请求已在关闭执行的条件下完成链路测试，未执行真实预热。小喵固件尚未接入或实机验证。部署状况会变化，后续升级前应重新核对。
 
 ### 凭据与边界
 
@@ -238,7 +238,7 @@ journalctl -u status-relay-agent.service -n 50 --no-pager
 - 小喵提交预热：独立的 `HOME_DEVICE_ID` 与 `HOME_DEVICE_SECRET`，HMAC-SHA256。服务启动时要求 secret 至少 32 个字符且与其他凭据不同；密钥泄漏可在服务配置中替换并重启，设备同步更新。读凭据与命令凭据独立轮换。
 - 家庭 Agent：单独的 `HOME_AGENT_TOKEN`；该令牌能写状态、领取命令并提交执行结果，只放在可信家庭主机和 143，不交给小喵或公开代理。家庭 Agent 与本服务使用 HTTPS；仅在 Tailscale 等已确认受保护的私网中才可明确设置 `HOME_ALLOW_PRIVATE_HTTP=1`。
 - 读取和 Agent token 用独立、随机、至少 32 个字符的值。凭据通过受限环境文件或密钥文件配置，文件只允许服务账户读取，不写进固件源码、仓库、请求日志或 URL。小喵端使用受保护的设备配置；设备固件提取仍可能泄密，必要时吊销并轮换。
-- Ubuntu 原服务的 `/api/preheat` 和 `/api/preheat/status` 使用其已有的 `PREHEAT_TOKEN_FILE` Bearer token；没有配置 token 时退回允许来源 IP，家庭 Agent 在这种模式下不能假定自己被允许。Agent 用 `HOME_QUOTA_TOKEN_FILE` 指向本机受限令牌文件；不要关闭 Ubuntu 原有鉴权。
+- Ubuntu 的 guard 补丁增加 `PREHEAT_RELAY_TOKEN_FILE`，供家庭 Agent 使用独立 Bearer token；原有 `PREHEAT_TOKEN_FILE` 或来源 IP 规则继续有效。该独立令牌的预热请求必须携带 guard 头，状态读取也使用它。Agent 用 `HOME_QUOTA_TOKEN_FILE` 指向仅相关服务账户可读的令牌文件；不要关闭 Ubuntu 原有鉴权。
 
 ### 状态查询
 
@@ -284,10 +284,10 @@ Content-Type: application/json
 
 ### Ubuntu 原子 guard 与部署前置条件
 
-现有 Ubuntu `Preheater.run()` 的手动模式没有在锁内检查活跃窗口；外部预检查无法消除与自动预热或其他请求的竞态。因此 `home_agent.py` 默认 `HOME_ENABLE_PREHEAT` 不开启，并要求 Ubuntu `/api/preheat/status` 返回 `remote_preheat_guard: 1`；未提供 guard 时即便显式开启也会拒绝调用。`deploy/quota-remote-guard.patch` 针对所检查的 Ubuntu 源码：通过 `X-Preheat-Guard: 1` 选择 `source=remote`，在现有预热锁内重新检查额度新鲜度和活跃窗口；手动局域网流程保持原样。补丁尚未部署，目标服务部署前必须对实际源码做哈希比对、备份、运行其测试并验证旧接口；如源码不匹配不要强行应用。守卫与其他预热共享锁和已有成功/失败冷却；它无法阻止非预热的其他 Codex 会话在检查后独立创建窗口，所以仍不能承诺窗口状态不会变化。
+现有 Ubuntu `Preheater.run()` 的手动模式没有在锁内检查活跃窗口；外部预检查无法消除与自动预热或其他请求的竞态。因此 `home_agent.py` 默认 `HOME_ENABLE_PREHEAT` 不开启，并要求 Ubuntu `/api/preheat/status` 返回 `remote_preheat_guard: 1`；未提供 guard 时即便显式开启也会拒绝调用。`deploy/quota-remote-guard.patch` 针对所检查的 Ubuntu 源码：通过 `X-Preheat-Guard: 1` 选择 `source=remote`，在现有预热锁内重新检查额度新鲜度和活跃窗口；手动局域网流程保持原样。已在目标服务上比对源码、备份并部署；以后升级前仍需重新核对版本、备份并验证旧接口，如源码不匹配不要强行应用。守卫与其他预热共享锁和已有成功/失败冷却；它无法阻止非预热的其他 Codex 会话在检查后独立创建窗口，所以仍不能承诺窗口状态不会变化。
 
 实际启用之前，必须核实 Ubuntu 状态 token 的配置、授权 Agent 访问方式、服务身份和数据库权限。预热是实质性操作，会消耗额度；部署和模拟测试不自动调用真实预热。要进行一次真实验证须事先获得用户明确确认。
 
 ### 网络部署原则
 
-建议新服务默认监听 143 的回环或 Tailscale 地址及单独端口 8781。公网 HTTPS 代理只允许 `GET /v1/home/state`、`POST /v1/home/commands` 和 `GET /v1/home/commands/<UUID>`；拒绝其他方法及所有 `/v1/home/agent/*`、现有 `/v1/events`、`/v1/ack` 和管理路径。家庭 Agent 通过 Tailscale 或单独受保护的内网路径访问 agent 接口，不能把 agent token 发给公网客户端。Nginx 使用独立限流区限制源 IP 的连接和请求、请求体不超过 8192 字节、合理读写超时，关闭敏感请求头和请求体日志；服务内的每设备速率限制不能替代代理层限流或磁盘监控。证书使用有效域名和可信 CA，严格验证；尚未确定域名和 DNS，当前无公网可用 URL。
+建议新服务默认监听 143 的回环或 Tailscale 地址及单独端口 8781。公网 HTTPS 代理只允许 `GET /v1/home/state`、`POST /v1/home/commands` 和 `GET /v1/home/commands/<UUID>`；拒绝其他方法及所有 `/v1/home/agent/*`、现有 `/v1/events`、`/v1/ack` 和管理路径。家庭 Agent 通过 Tailscale 或单独受保护的内网路径访问 agent 接口，不能把 agent token 发给公网客户端。Nginx 使用独立限流区限制源 IP 的连接和请求、请求体不超过 8192 字节、合理读写超时，关闭敏感请求头和请求体日志；服务内的每设备速率限制不能替代代理层限流或磁盘监控。当前公网地址为 `https://statusrelay.hkz.241214.top`。该站点使用覆盖域名的通配符证书，公开链包含 Let's Encrypt YE2、ISRG Root YE 及 ISRG Root X2 交叉签名；可使用 [ISRG Root X1](certs/isrg-root-x1.pem) 作为信任锚，并核验主机名、有效期和完整链。该文件是公开根证书，不是私钥；需保留信任锚及证书链轮换方案。实际 TLS 客户端兼容性仍需在设备上验证。

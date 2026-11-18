@@ -45,3 +45,22 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
                     response=await client.post('/api/preheat',headers=headers,json={})
                     self.assertEqual((await response.json())['status'],'waiting_reset')
                     run.assert_awaited_once_with(c,source='remote')
+
+    async def test_relay_credential_is_separate_and_preserves_lan_rule(self):
+        from aiohttp.test_utils import TestClient,TestServer
+        c=self.module.Collector('unused',60)
+        async def idle(): await asyncio.Future()
+        with tempfile.TemporaryDirectory() as d:
+            token=Path(d)/'relay-token'; token.write_text('fixture-relay-token')
+            env={'PREHEAT_RELAY_TOKEN_FILE':str(token),'PREHEAT_ALLOWED_IP':'127.0.0.1'}
+            with patch.dict(os.environ,env,clear=False),patch.object(c,'poll',idle),patch.object(c.preheater,'run',new=AsyncMock(return_value={'ok':False,'status':'waiting_reset'})) as run:
+                async with TestClient(TestServer(self.module.create_app(c))) as client:
+                    self.assertEqual((await client.get('/api/preheat/status')).status,200)
+                    self.assertEqual((await client.post('/api/preheat',json={})).status,200)
+                    run.assert_awaited_with(c,source='manual')
+                    headers={'Authorization':'Bearer fixture-relay-token'}
+                    self.assertEqual((await client.get('/api/preheat/status',headers=headers)).status,200)
+                    self.assertEqual((await client.post('/api/preheat',headers=headers,json={})).status,401)
+                    headers['X-Preheat-Guard']='1'
+                    self.assertEqual((await client.post('/api/preheat',headers=headers,json={})).status,200)
+                    run.assert_awaited_with(c,source='remote')

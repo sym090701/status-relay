@@ -1,13 +1,10 @@
 --- a/quota_server.py
 +++ b/quota_server.py
-@@ -136,3 +136,4 @@
-                     ZoneInfo("Asia/Shanghai")).strftime("%m-%d %H:%M")
+@@ -137 +137,2 @@
 -        return {"thread_id_present": bool(self.state.get("thread_id")),
 +        return {"remote_preheat_guard": 1,
 +                "thread_id_present": bool(self.state.get("thread_id")),
-                 "last_result": self.state.get("last_result"),
-@@ -243,2 +244,12 @@
-                         "retry_after_seconds": int(failure_until - now)}
+@@ -243,0 +245,10 @@
 +            if source == "remote":
 +                # Check under the same lock as manual and automatic preheats.
 +                usage = collector.snapshot()["usage"]
@@ -18,10 +15,37 @@
 +                    return {"ok": False, "status": "quota_unavailable"}
 +                if reset_at > now and used > 0:
 +                    return {"ok": False, "status": "waiting_reset"}
-             if source == "auto":
-@@ -589,3 +600,4 @@
-             raise web.HTTPUnauthorized(text="Unauthorized")
+@@ -581,0 +593,11 @@
++    def relay_authorized(request):
++        token_file = os.environ.get("PREHEAT_RELAY_TOKEN_FILE")
++        if not token_file:
++            return False
++        try:
++            token = Path(token_file).read_text().strip()
++        except OSError:
++            return False
++        return bool(token) and secrets.compare_digest(
++            request.headers.get("Authorization", "").encode(), ("Bearer " + token).encode())
++
+@@ -582,0 +605,3 @@
++        relay_auth = relay_authorized(request)
++        if relay_auth and request.headers.get("X-Preheat-Guard") != "1":
++            raise web.HTTPUnauthorized(text="Unauthorized")
+@@ -587,2 +612,3 @@
+-        if (token and not secrets.compare_digest(supplied, "Bearer " + token)) or \
+-                (not token and request.remote != allowed_ip):
++        legacy_auth = ((token and secrets.compare_digest(supplied, "Bearer " + token)) or
++                       (not token and request.remote == allowed_ip))
++        if not relay_auth and not legacy_auth:
+@@ -590 +616,2 @@
 -        return web.json_response(await collector.preheater.run(collector))
 +        source = "remote" if request.headers.get("X-Preheat-Guard") == "1" else "manual"
 +        return web.json_response(await collector.preheater.run(collector, source=source))
-     async def preheat_status(request):
+@@ -591,0 +619 @@
++        relay_auth = relay_authorized(request)
+@@ -596,2 +624,3 @@
+-        if (token and not secrets.compare_digest(supplied, "Bearer " + token)) or \
+-                (not token and request.remote != allowed_ip):
++        legacy_auth = ((token and secrets.compare_digest(supplied, "Bearer " + token)) or
++                       (not token and request.remote == allowed_ip))
++        if not relay_auth and not legacy_auth:
