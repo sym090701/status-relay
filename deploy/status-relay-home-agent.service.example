@@ -1,0 +1,18 @@
+[Unit]
+Description=Status Relay outbound home agent
+After=network-online.target
+[Service]
+User=status-relay-home-agent
+Group=status-relay-home-agent
+WorkingDirectory=/opt/status-relay
+EnvironmentFile=/etc/status-relay-home/agent.env
+ExecStart=/usr/bin/python3 /opt/status-relay/home_agent.py
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/status-relay-home-agent
+[Install]
+WantedBy=multi-user.target

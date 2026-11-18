@@ -225,3 +225,69 @@ journalctl -u status-relay-agent.service -n 50 --no-pager
 - systemd 服务启动和重启。
 
 运行时数据、环境文件、SQLite 数据库和密钥均不应提交到 Git。
+
+## 小喵家外状态和预热（代码已实现，尚未部署）
+
+`home_relay.py` 是独立的单项目服务，使用独立 SQLite 数据库和凭据，不接入 `/v1/events` 或 NAS Agent 的 ACK 队列。`home_agent.py` 在家庭侧主动连接该服务，读取 Ubuntu 额度服务并提交经过白名单筛选的状态；它只支持固定的 `preheat` 操作，不能执行 Shell、任意 URL 或文件操作。小喵在家庭 Wi-Fi 沿用原有局域网接口；SSID 只是网络选择条件，不能作为身份认证。
+
+**当前状态：** 本地模拟和 Ubuntu 源码副本上的 guard 补丁测试通过。新服务、家庭 Agent、Ubuntu guard、HTTPS 反代和小喵固件均未部署或实机验证；未执行真实预热。143 当前已有 Nginx 监听 80/443，但只读检查未发现它转发 8780、8781 或 `/v1/home/`；需先确认域名、DNS、证书和允许公开的路径，不能把现有 Relay 或家庭管理端口直接暴露。配置前请先备份并检查原有 Nginx、DNS 和服务。
+
+### 凭据与边界
+
+- 小喵状态及命令结果读取：`HOME_READ_TOKEN`，Bearer token，只能读取本服务的小喵数据；不能领取命令或访问 NAS 队列。
+- 小喵提交预热：独立的 `HOME_DEVICE_ID` 与 `HOME_DEVICE_SECRET`，HMAC-SHA256。服务启动时要求 secret 至少 32 个字符且与其他凭据不同；密钥泄漏可在服务配置中替换并重启，设备同步更新。读凭据与命令凭据独立轮换。
+- 家庭 Agent：单独的 `HOME_AGENT_TOKEN`；该令牌能写状态、领取命令并提交执行结果，只放在可信家庭主机和 143，不交给小喵或公开代理。家庭 Agent 与本服务使用 HTTPS；仅在 Tailscale 等已确认受保护的私网中才可明确设置 `HOME_ALLOW_PRIVATE_HTTP=1`。
+- 读取和 Agent token 用独立、随机、至少 32 个字符的值。凭据通过受限环境文件或密钥文件配置，文件只允许服务账户读取，不写进固件源码、仓库、请求日志或 URL。小喵端使用受保护的设备配置；设备固件提取仍可能泄密，必要时吊销并轮换。
+- Ubuntu 原服务的 `/api/preheat` 和 `/api/preheat/status` 使用其已有的 `PREHEAT_TOKEN_FILE` Bearer token；没有配置 token 时退回允许来源 IP，家庭 Agent 在这种模式下不能假定自己被允许。Agent 用 `HOME_QUOTA_TOKEN_FILE` 指向本机受限令牌文件；不要关闭 Ubuntu 原有鉴权。
+
+### 状态查询
+
+`GET https://<域名>/v1/home/state`，请求头 `Authorization: Bearer <读取令牌>`。响应例子：
+
+```json
+{"freshness":"fresh","updated_at":1800000000,"age_seconds":8,"data":{"quota":{"ok":true,"stale":false,"server_updated_epoch":1800000000,"five_hour":{"remaining_percent":90,"used_percent":10,"reset_at_epoch":1800010000}},"mac":{"online":true},"preheat":{"phase":"idle","cooldown_active":false,"last_result":"completed"}}}
+```
+
+数据由家庭 Agent 从 `/usage`、`/health` 和鉴权后的 `/api/preheat/status` 中提取白名单字段；不会上传线程 ID、账号凭据、Wi-Fi 密码或完整配置。状态请求体最多 8192 字节；未收到过状态时 `freshness=offline` 且 `data=null`。收到后由 Relay 接收时间计算：不超过 120 秒为 `fresh`，121–600 秒为 `stale`，超过 600 秒为 `offline`；后两者可能仍返回最后一次数据，但必须标记过期，不能显示成实时状态。额度本身还有 `stale` 和 `server_updated_epoch`，应分别检查。Mac 离线不等于家庭 Agent 离线。暂不提供趋势历史接口。
+
+### 预热提交和查询
+
+`POST https://<域名>/v1/home/commands`，JSON 请求体必须严格包含以下三个字段：
+
+```json
+{"request_id":"b3d35d79-04c7-4d33-bf98-f45ff5e0b4e3","operation":"preheat","expires_at":1800000060}
+```
+
+`request_id` 为客户端生成的小写标准 UUID；`expires_at` 为 Unix 秒，首次提交时必须大于服务端当前时间且最多提前 300 秒。保留原始请求体及其过期时间，超时重试使用同一 ID 和同一请求体；新建用户操作才生成新 ID。签名请求头：
+
+```text
+X-Device-Id: <设备ID>
+X-Timestamp: <Unix秒>
+X-Nonce: <16–96位随机字母、数字、下划线或短横线>
+X-Signature: <小写HMAC-SHA256十六进制>
+Content-Type: application/json
+```
+
+签名消息为 `POST + "\n" + "/v1/home/commands" + "\n" + timestamp + "\n" + nonce + "\n" + sha256(body)`；`sha256(body)` 是实际发送的原始字节的小写十六进制摘要，HMAC 密钥为 `HOME_DEVICE_SECRET` 的 UTF-8 字节。不要改变请求体序列化后再发送；每次传输包括重试使用新的时间戳、Nonce 和签名，服务端允许时间偏差 60 秒并持久化 Nonce 防重放。设备需先安全同步时间并验证服务端 TLS 证书的主机名、有效期和可信 CA；使用硬编码证书时必须规划轮换，不能关闭验证或信任所有证书。
+
+接收响应 `202`：`{"request_id":"...","status":"pending","reason":"accepted","expires_at":1800000060}`。同 ID、相同内容的幂等重试返回 200 和当前状态；同 ID 不同有效期返回 409。`401` 签名无效或超出时间窗，`409` 也可表示 Nonce 重放，`429` 表示已有待处理、执行中或待人工处理的不确定命令，或速率限制。客户端应退避，不自动生成新 ID 规避限制。每设备最多 5 次新命令/分钟，同一时间最多一个未完成命令。
+
+`GET https://<域名>/v1/home/commands/<request_id>` 使用读取令牌查询，示例：
+
+```json
+{"request_id":"b3d35d79-04c7-4d33-bf98-f45ff5e0b4e3","status":"completed","reason":"turn_completed","expires_at":1800000060,"window":{"result":"reset_changed_unconfirmed","before_reset":1800000000,"after_reset":1800018000}}
+```
+
+状态含义：`accepted` 写入审计记录，提交响应中的 `pending` 表示等待家庭 Agent；`running` 表示 Agent 已领取，并不证明本地请求已发出；`completed` 表示 Ubuntu 报告 turn 完成及随后的额度刷新成功；`failed` 表示未执行或确定拒绝；`expired` 表示家庭 Agent 在有效期内未领取；`unknown` 表示无法确认是否执行。**接受不等于完成；turn 完成和 `reset_changed_unconfirmed` 都不证明新 5 小时窗口已经激活。** 小喵可每 5–10 秒轮询，设置有限超时，网络中断时保留 ID，恢复后查询。结果为 `unknown` 时不要自动重新提交；检查 Ubuntu 和 Relay 审计后，只有本机运维人员可用 `HOME_RELAY_DB=... python3 home_admin.py <request_id> --reason reviewed` 解除后续命令阻塞；原结果仍保留为 `unknown`。
+
+家庭侧 SQLite journal 在调用前持久化执行标记，调用后若进程崩溃、响应超时或结果不明则不再自动调用。Relay 领取时先持久化 `running`；300 秒内没有结果会转为 `unknown`，不会重新领取。结果在家庭侧已持久化但上报丢失时，只重发结果。Relay `audit` 表保存无密钥的请求 ID、设备 ID、时间、状态变化、原因及可获得的窗口观察，不能仅凭它证明新的额度窗口。
+
+### Ubuntu 原子 guard 与部署前置条件
+
+现有 Ubuntu `Preheater.run()` 的手动模式没有在锁内检查活跃窗口；外部预检查无法消除与自动预热或其他请求的竞态。因此 `home_agent.py` 默认 `HOME_ENABLE_PREHEAT` 不开启，并要求 Ubuntu `/api/preheat/status` 返回 `remote_preheat_guard: 1`；未提供 guard 时即便显式开启也会拒绝调用。`deploy/quota-remote-guard.patch` 针对所检查的 Ubuntu 源码：通过 `X-Preheat-Guard: 1` 选择 `source=remote`，在现有预热锁内重新检查额度新鲜度和活跃窗口；手动局域网流程保持原样。补丁尚未部署，目标服务部署前必须对实际源码做哈希比对、备份、运行其测试并验证旧接口；如源码不匹配不要强行应用。守卫与其他预热共享锁和已有成功/失败冷却；它无法阻止非预热的其他 Codex 会话在检查后独立创建窗口，所以仍不能承诺窗口状态不会变化。
+
+实际启用之前，必须核实 Ubuntu 状态 token 的配置、授权 Agent 访问方式、服务身份和数据库权限。预热是实质性操作，会消耗额度；部署和模拟测试不自动调用真实预热。要进行一次真实验证须事先获得用户明确确认。
+
+### 网络部署原则
+
+建议新服务默认监听 143 的回环或 Tailscale 地址及单独端口 8781。公网 HTTPS 代理只允许 `GET /v1/home/state`、`POST /v1/home/commands` 和 `GET /v1/home/commands/<UUID>`；拒绝其他方法及所有 `/v1/home/agent/*`、现有 `/v1/events`、`/v1/ack` 和管理路径。家庭 Agent 通过 Tailscale 或单独受保护的内网路径访问 agent 接口，不能把 agent token 发给公网客户端。Nginx 使用独立限流区限制源 IP 的连接和请求、请求体不超过 8192 字节、合理读写超时，关闭敏感请求头和请求体日志；服务内的每设备速率限制不能替代代理层限流或磁盘监控。证书使用有效域名和可信 CA，严格验证；尚未确定域名和 DNS，当前无公网可用 URL。

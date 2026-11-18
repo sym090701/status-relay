@@ -1,0 +1,18 @@
+[Unit]
+Description=Status Relay isolated home service
+After=network-online.target
+[Service]
+User=status-relay-home
+Group=status-relay-home
+WorkingDirectory=/opt/status-relay
+EnvironmentFile=/etc/status-relay-home/relay.env
+ExecStart=/usr/bin/python3 /opt/status-relay/home_relay.py
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/status-relay-home
+[Install]
+WantedBy=multi-user.target

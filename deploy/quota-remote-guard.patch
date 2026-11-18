@@ -1,0 +1,27 @@
+--- a/quota_server.py
++++ b/quota_server.py
+@@ -136,3 +136,4 @@
+                     ZoneInfo("Asia/Shanghai")).strftime("%m-%d %H:%M")
+-        return {"thread_id_present": bool(self.state.get("thread_id")),
++        return {"remote_preheat_guard": 1,
++                "thread_id_present": bool(self.state.get("thread_id")),
+                 "last_result": self.state.get("last_result"),
+@@ -243,2 +244,12 @@
+                         "retry_after_seconds": int(failure_until - now)}
++            if source == "remote":
++                # Check under the same lock as manual and automatic preheats.
++                usage = collector.snapshot()["usage"]
++                window = usage.get("five_hour") or {}
++                reset_at, used = window.get("reset_at_epoch"), window.get("used_percent")
++                if (not usage.get("ok") or usage.get("stale") or
++                        type(reset_at) not in (int, float) or type(used) not in (int, float)):
++                    return {"ok": False, "status": "quota_unavailable"}
++                if reset_at > now and used > 0:
++                    return {"ok": False, "status": "waiting_reset"}
+             if source == "auto":
+@@ -589,3 +600,4 @@
+             raise web.HTTPUnauthorized(text="Unauthorized")
+-        return web.json_response(await collector.preheater.run(collector))
++        source = "remote" if request.headers.get("X-Preheat-Guard") == "1" else "manual"
++        return web.json_response(await collector.preheater.run(collector, source=source))
+     async def preheat_status(request):
