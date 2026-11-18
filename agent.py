@@ -7,9 +7,11 @@ import argparse
 import json
 import os
 import sqlite3
+import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +20,7 @@ class AgentStore:
     def __init__(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
         self.path = root / "events.sqlite3"
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -37,12 +39,12 @@ class AgentStore:
             )
 
     def cursor(self) -> int:
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             row = db.execute("SELECT value FROM meta WHERE key='cursor'").fetchone()
             return int(row[0]) if row else 0
 
     def save_events(self, events: list[dict[str, Any]]) -> int:
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             for event in events:
                 db.execute(
                     """
@@ -64,7 +66,7 @@ class AgentStore:
             return max((event["seq"] for event in events), default=self.cursor())
 
     def advance_cursor(self, cursor: int) -> None:
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute(
                 "INSERT INTO meta(key, value) VALUES('cursor', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(cursor),),
@@ -108,14 +110,19 @@ def main() -> None:
     base_url = os.environ["RELAY_URL"]
     token = os.environ["RELAY_AGENT_TOKEN"]
     store = AgentStore(Path(os.environ.get("AGENT_DATA_DIR", "./data/nas-agent")))
+    limit = min(100, max(1, args.limit))
     while True:
         try:
-            poll_once(base_url, token, store, min(100, max(1, args.limit)))
+            received = poll_once(base_url, token, store, limit)
         except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as exc:
             print(f"poll failed: {exc}")
+            if args.once:
+                sys.exit(1)
+            received = 0
         if args.once:
             break
-        time.sleep(int(os.environ.get("AGENT_POLL_SECONDS", "30")))
+        if received < limit:
+            time.sleep(int(os.environ.get("AGENT_POLL_SECONDS", "30")))
 
 
 if __name__ == "__main__":

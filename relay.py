@@ -11,6 +11,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from contextlib import closing, contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,20 +38,27 @@ class RelayConfig:
         self.port = int(os.environ.get("RELAY_PORT", "8780"))
         self.db_path = Path(os.environ.get("RELAY_DB", "./data/relay.sqlite3"))
         self.ingest_keys = _parse_map(os.environ.get("RELAY_INGEST_KEYS", ""))
+        self.ingest_projects = _parse_map(os.environ.get("RELAY_INGEST_PROJECTS", ""))
         self.agent_tokens = _parse_map(os.environ.get("RELAY_AGENT_TOKENS", ""))
         self.max_body_bytes = int(os.environ.get("RELAY_MAX_BODY_BYTES", "65536"))
         self.timestamp_skew = int(os.environ.get("RELAY_TIMESTAMP_SKEW", "300"))
         self.event_ttl = int(os.environ.get("RELAY_EVENT_TTL", "604800"))
+        self.max_events = int(os.environ.get("RELAY_MAX_EVENTS", "100000"))
         if not self.ingest_keys:
             raise ValueError("RELAY_INGEST_KEYS is required")
         if not self.agent_tokens:
             raise ValueError("RELAY_AGENT_TOKENS is required")
+        if set(self.ingest_projects) != set(self.ingest_keys):
+            raise ValueError("RELAY_INGEST_PROJECTS must bind every ingest key to a project")
+        if self.max_events < 1:
+            raise ValueError("RELAY_MAX_EVENTS must be positive")
 
 
 class RelayStore:
-    def __init__(self, path: Path, event_ttl: int) -> None:
+    def __init__(self, path: Path, event_ttl: int, max_events: int) -> None:
         self.path = path
         self.event_ttl = event_ttl
+        self.max_events = max_events
         self.lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as db:
@@ -80,10 +88,12 @@ class RelayStore:
                 """
             )
 
-    def connection(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        return db
+    @contextmanager
+    def connection(self):
+        with closing(sqlite3.connect(self.path, timeout=10)) as db:
+            db.row_factory = sqlite3.Row
+            with db:
+                yield db
 
     def remember_nonce(self, key_id: str, nonce: str, expires_at: int) -> bool:
         with self.lock, self.connection() as db:
@@ -98,8 +108,14 @@ class RelayStore:
                 return False
             return True
 
-    def put_event(self, event: dict[str, Any], now: int) -> tuple[int, bool]:
+    def put_event(self, event: dict[str, Any], now: int) -> tuple[int, bool] | None:
         with self.lock, self.connection() as db:
+            row = db.execute("SELECT seq FROM events WHERE event_id = ?", (event["event_id"],)).fetchone()
+            if row:
+                return int(row["seq"]), True
+            db.execute("DELETE FROM events WHERE expires_at < ? AND acked_at IS NOT NULL", (now,))
+            if db.execute("SELECT COUNT(*) FROM events").fetchone()[0] >= self.max_events:
+                return None
             try:
                 cur = db.execute(
                     """
@@ -292,7 +308,14 @@ class RelayHandler(BaseHTTPRequestHandler):
             if not all(isinstance(event.get(field), str) and event[field].strip() for field in required[:4]):
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "event metadata must be non-empty strings"})
                 return
-            seq, duplicate = self.store.put_event(event, int(time.time()))
+            if self.cfg.ingest_projects.get(self.headers.get("X-Relay-Key-Id", "")) != event["project"]:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "key not authorized for project"})
+                return
+            result = self.store.put_event(event, int(time.time()))
+            if result is None:
+                self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "queue capacity reached; retry later"})
+                return
+            seq, duplicate = result
             self.send_json(HTTPStatus.OK, {"accepted": True, "duplicate": duplicate, "seq": seq})
             return
         if parsed.path == "/v1/ack":
@@ -317,7 +340,7 @@ class RelayServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], cfg: RelayConfig) -> None:
         super().__init__(address, RelayHandler)
         self.cfg = cfg
-        self.store = RelayStore(cfg.db_path, cfg.event_ttl)
+        self.store = RelayStore(cfg.db_path, cfg.event_ttl, cfg.max_events)
 
 
 def main() -> None:

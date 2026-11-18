@@ -10,6 +10,7 @@ import unittest
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 from relay import RelayConfig, RelayServer
@@ -48,10 +49,12 @@ class RelayTests(unittest.TestCase):
         cfg.port = 0
         cfg.db_path = Path(self.temp.name) / "relay.sqlite3"
         cfg.ingest_keys = {"demo": "webhook-secret"}
+        cfg.ingest_projects = {"demo": "p"}
         cfg.agent_tokens = {"nas158": "agent-secret"}
         cfg.max_body_bytes = 65536
         cfg.timestamp_skew = 300
         cfg.event_ttl = 3600
+        cfg.max_events = 100000
         self.server = RelayServer((cfg.bind, cfg.port), cfg)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -70,7 +73,7 @@ class RelayTests(unittest.TestCase):
     def test_ingest_pull_ack(self):
         event = {
             "event_id": "evt-1",
-            "project": "xiaomiao",
+            "project": "p",
             "source": "quota",
             "kind": "runtime_status",
             "payload": {"healthy": True},
@@ -114,6 +117,7 @@ class RelayTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.json_request(signed_request(f"{self.base}/v1/events", body, "webhook-secret", nonce=nonce))
         self.assertEqual(error.exception.code, 409)
+        error.exception.close()
 
     def test_duplicate_event_is_idempotent(self):
         event = {
@@ -144,8 +148,29 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(poll_once(self.base, "agent-secret", store, 10), 1)
         self.assertEqual(store.cursor(), 1)
         self.assertEqual(poll_once(self.base, "agent-secret", store, 10), 0)
-        with __import__("sqlite3").connect(store.path) as db:
+        with closing(__import__("sqlite3").connect(store.path)) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
+
+    def test_cross_project_ingest_is_forbidden(self):
+        event = {"event_id": "other", "project": "other", "source": "s", "kind": "k", "payload": {}}
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.json_request(signed_request(f"{self.base}/v1/events", json.dumps(event).encode(), "webhook-secret"))
+        self.assertEqual(error.exception.code, 403)
+        error.exception.close()
+        self.assertEqual(self.server.store.pending_count(), 0)
+
+    def test_capacity_rejects_new_events_but_keeps_duplicates_and_pending(self):
+        self.server.store.max_events = 1
+        event = {"event_id": "first", "project": "p", "source": "s", "kind": "k", "payload": {}}
+        body = json.dumps(event).encode()
+        self.json_request(signed_request(f"{self.base}/v1/events", body, "webhook-secret"))
+        self.assertTrue(self.json_request(signed_request(f"{self.base}/v1/events", body, "webhook-secret"))["duplicate"])
+        event["event_id"] = "second"
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.json_request(signed_request(f"{self.base}/v1/events", json.dumps(event).encode(), "webhook-secret"))
+        self.assertEqual(error.exception.code, 503)
+        error.exception.close()
+        self.assertEqual(self.server.store.pending_count(), 1)
 
 
 if __name__ == "__main__":
